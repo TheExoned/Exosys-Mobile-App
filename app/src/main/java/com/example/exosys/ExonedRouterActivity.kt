@@ -1835,6 +1835,68 @@ object UrbanScannerEngine {
         return smoothed
     }
 
+    private fun buildPolygonClippedStrips(
+        s: Double,
+        n: Double,
+        w: Double,
+        e: Double,
+        rings: List<List<GeoPoint>>?,
+        hasPoly: Boolean,
+        maxLatStep: Double
+    ): List<DoubleArray> {
+        val strips = ArrayList<DoubleArray>()
+        val latSpan = max(0.001, n - s)
+        val numBands = max(1, kotlin.math.ceil(latSpan / maxLatStep).toInt())
+        val bandStep = latSpan / numBands.toDouble()
+
+        for (b in 0 until numBands) {
+            val bs = s + b * bandStep
+            val bn = if (b == numBands - 1) n else (s + (b + 1) * bandStep)
+            var minLonB = w
+            var maxLonB = e
+
+            if (hasPoly && !rings.isNullOrEmpty()) {
+                var fMin = 1e9
+                var fMax = -1e9
+                for (ring in rings) {
+                    if (ring.isEmpty()) continue
+                    var prevLat = ring.last().lat
+                    var prevLon = ring.last().lon
+                    for (pt in ring) {
+                        val clat = pt.lat
+                        val clon = pt.lon
+                        if (clat in bs..bn) {
+                            if (clon < fMin) fMin = clon
+                            if (clon > fMax) fMax = clon
+                        }
+                        val segS = min(prevLat, clat)
+                        val segN = max(prevLat, clat)
+                        if (segN >= bs && segS <= bn && abs(clat - prevLat) > 1e-9) {
+                            for (clipLat in doubleArrayOf(bs, bn)) {
+                                if (clipLat in segS..segN) {
+                                    val t = (clipLat - prevLat) / (clat - prevLat)
+                                    val clipLon = prevLon + t * (clon - prevLon)
+                                    if (clipLon < fMin) fMin = clipLon
+                                    if (clipLon > fMax) fMax = clipLon
+                                }
+                            }
+                        }
+                        prevLat = clat
+                        prevLon = clon
+                    }
+                }
+                if (fMin <= fMax) {
+                    minLonB = max(w, fMin - 0.015)
+                    maxLonB = min(e, fMax + 0.015)
+                } else {
+                    continue
+                }
+            }
+            strips.add(doubleArrayOf(bs, minLonB, bn, maxLonB))
+        }
+        return if (strips.isNotEmpty()) strips else listOf(doubleArrayOf(s, w, n, e))
+    }
+
     fun scanPopulatedZonesWithProgress(
         north: Double,
         south: Double,
@@ -1843,8 +1905,37 @@ object UrbanScannerEngine {
         selectionRings: List<List<GeoPoint>>?,
         hasCustomPolygon: Boolean,
         stateRelationId: Long = 0L,
+        onSectorProgress: (Boolean, Int, String) -> Unit = { _, _, _ -> },
         onProgress: (Int, String) -> Unit
     ): Result<UrbanScanResult> {
+        val globalStartMs = System.currentTimeMillis()
+        var maxGlobalPct = 5
+
+        fun fmtElapsed(startMs: Long): String {
+            val sec = ((System.currentTimeMillis() - startMs) / 1000L).coerceAtLeast(0L)
+            val m = sec / 60L
+            val sRem = sec % 60L
+            return if (m > 0L) {
+                String.format(Locale.US, "%02dm %02ds", m, sRem)
+            } else {
+                String.format(Locale.US, "%02ds", sRem)
+            }
+        }
+
+        fun emitSyncedProgress(
+            globalTargetPct: Int,
+            globalMsg: String,
+            sectorVisible: Boolean,
+            sectorPct: Int,
+            sectorMsg: String
+        ) {
+            if (globalTargetPct > maxGlobalPct) {
+                maxGlobalPct = globalTargetPct.coerceIn(5, 100)
+            }
+            onSectorProgress(sectorVisible, sectorPct.coerceIn(0, 100), sectorMsg)
+            onProgress(maxGlobalPct, globalMsg)
+        }
+
         val s = min(south, north)
         val n = max(south, north)
         val w = min(west, east)
@@ -1875,104 +1966,76 @@ object UrbanScannerEngine {
         val bboxStr = String.format(Locale.US, "%.5f,%.5f,%.5f,%.5f", s, w, n, e)
 
         val streetClauseLocal = if (isLocalScale) {
-            "way[\"highway\"~\"^(residential|living_street|pedestrian)$\"]($bboxStr); out geom qt;"
+            """
+            (
+              way["highway"="residential"]($bboxStr);
+              way["highway"="living_street"]($bboxStr);
+              way["highway"="pedestrian"]($bboxStr);
+            );
+            out ids bb qt;
+            """.trimIndent()
         } else ""
 
-        // BLINDAJE ANTI-502 Y ANTI-TIMEOUT (RIUV):
-        // 'out qt;' fuerza a Overpass a escupir los nodos ANTES de procesar los polígonos.
-        // Esto mantiene la conexión fluyendo desde el segundo 1 y engaña al cortafuegos para que no la tire por inactividad.
-        val queryStage1 = if (stateRelationId > 0L && !isLocalScale) {
-            val areaId = 3600000000L + stateRelationId
-            """
-                [out:json][timeout:180];
-                area($areaId)->.st;
-                node["place"~"^(city|town|village|hamlet|suburb|quarter|neighbourhood|isolated_dwelling|locality)$"](area.st);
-                out qt;
-                way["place"~"^(city|town|village|hamlet|suburb|quarter|neighbourhood)$"](area.st);
-                out geom qt;
-                way["landuse"~"^(residential|commercial|industrial|retail|education|institutional)$"](area.st);
-                out geom qt;
-            """.trimIndent()
-        } else {
-            """
-                [out:json][timeout:180];
-                node["place"~"^(city|town|village|hamlet|suburb|quarter|neighbourhood|isolated_dwelling|locality)$"]($bboxStr);
-                out qt;
-                way["place"~"^(city|town|village|hamlet|suburb|quarter|neighbourhood)$"]($bboxStr);
-                out geom qt;
-                way["landuse"~"^(residential|commercial|industrial|retail|education|institutional)$"]($bboxStr);
-                out geom qt;
-                $streetClauseLocal
-            """.trimIndent()
-        }
-
-        val fallbackBboxStage1 = """
-            [out:json][timeout:180];
+        val queryStage1 = """
+            [out:json][timeout:90];
             node["place"~"^(city|town|village|hamlet|suburb|quarter|neighbourhood|isolated_dwelling|locality)$"]($bboxStr);
             out qt;
             way["place"~"^(city|town|village|hamlet|suburb|quarter|neighbourhood)$"]($bboxStr);
             out geom qt;
             way["landuse"~"^(residential|commercial|industrial|retail|education|institutional)$"]($bboxStr);
             out geom qt;
+            $streetClauseLocal
         """.trimIndent()
 
         var parsedStage1 = false
         var stage1UsedMirror = 0
         var lastError = "Fallo de conexión con Overpass."
+        var stage1MaxSubPct = 0
 
         for ((mIdx, mirror) in OVERPASS_MIRRORS.withIndex()) {
             val ping = NetworkHealthMonitor.checkInternetPingMs()
             val bytesCounter = AtomicLong(0L)
             val stopWatcher = AtomicBoolean(false)
             val tStart = System.currentTimeMillis()
-            val queryToSend = if (mIdx == 2 && stateRelationId > 0L) fallbackBboxStage1 else queryStage1
 
             val watcher = thread(start = true, isDaemon = true) {
-                var silence_seconds = 0
-                var last_kb = 0L
                 while (!stopWatcher.get()) {
                     val elapsed = (System.currentTimeMillis() - tStart) / 1000.0
                     val kb = bytesCounter.get() / 1024L
 
-                    if (kb == last_kb) silence_seconds++ else silence_seconds = 0
-                    last_kb = kb
-
-                    if (kb == 0L) {
-                        val curPing = if (elapsed > 4.0) NetworkHealthMonitor.checkInternetPingMs() else ping
-                        val msg = if (curPing < 0L) {
-                            "[INTERNET INESTABLE / CAÍDO] Esperando reconexión..."
-                        } else if (elapsed > 12.0) {
-                            "${NetworkHealthMonitor.formatNetTag(curPing)} | OSM está procesando (Tu red o proxy puede retrasarlo)... ${String.format(Locale.US, "%.1f", elapsed)}s"
-                        } else {
-                            "${NetworkHealthMonitor.formatNetTag(curPing)} | Etapa 1/2: Solicitando poblaciones base (${String.format(Locale.US, "%.1f", elapsed)}s)..."
-                        }
-                        // La barra se queda en el tope de 30% mientras kilobytes sean 0 para no falsear progreso
-                        onProgress(min(30, 8 + (elapsed * 1.5).toInt()), msg)
+                    val rawSubPct = if (kb == 0L) {
+                        ((1.0 - kotlin.math.exp(-elapsed / 12.0)) * 55.0).toInt().coerceIn(2, 55)
                     } else {
-                        val kbs = (kb / max(0.4, elapsed)).toInt()
+                        (55 + (kb / 16).toInt()).coerceIn(56, 98)
+                    }
+                    if (rawSubPct > stage1MaxSubPct) stage1MaxSubPct = rawSubPct
+
+                    // Barra general avanza de 5% a 30% en sincronía exacta con la barra de Etapa 1 (0% a 100%)
+                    val syncedGlobalPct = 5 + (stage1MaxSubPct * 25) / 100
+
+                    val secMsg = "▸ [Etapa 1/2 — Nodo ${mIdx + 1}]: $stage1MaxSubPct% ($kb KB | ${String.format(Locale.US, "%.1f", elapsed)}s) — ${seenPlaces.get()} pueblos"
+                    val globMsg = if (kb == 0L) {
+                        "[⏱ ${fmtElapsed(globalStartMs)}] ${NetworkHealthMonitor.formatNetTag(ping)} | Etapa 1/2: Solicitando poblaciones base..."
+                    } else {
+                        val kbs = (kb / max(0.3, elapsed)).toInt()
                         val nameHint = if (lastSeenName.isNotBlank()) " [$lastSeenName]" else ""
-                        val stallMsg = if (silence_seconds > 4) " (Esperando datos de OSM...)" else ""
-                        val msg = "[Etapa 1/2: $kb KB a $kbs KB/s]$stallMsg Leyendo$nameHint: ${seenPlaces.get()} pueblos, ${seenLanduse.get()} manchas"
-                        val pct = min(60, 30 + (kb / 25).toInt().coerceAtMost(30))
-                        onProgress(pct, msg)
+                        "[⏱ ${fmtElapsed(globalStartMs)}] Etapa 1/2 ($kb KB a $kbs KB/s)$nameHint: ${seenPlaces.get()} pueblos, ${seenLanduse.get()} polígonos"
                     }
-                    try {
-                        Thread.sleep(1000)
-                    } catch (_: InterruptedException) {
-                        break
-                    }
+
+                    emitSyncedProgress(syncedGlobalPct, globMsg, true, stage1MaxSubPct, secMsg)
+                    try { Thread.sleep(350) } catch (_: InterruptedException) { break }
                 }
             }
 
             var conn: HttpURLConnection? = null
             try {
-                val postData = "data=" + URLEncoder.encode(queryToSend, "UTF-8")
+                val postData = "data=" + URLEncoder.encode(queryStage1, "UTF-8")
                 conn = (URL(mirror).openConnection() as HttpURLConnection).apply {
                     requestMethod = "POST"
                     doOutput = true
-                    connectTimeout = 18000
-                    readTimeout = 180000 // 3 Minutos: Aguanta estados gigantes en redes lentas sin cortar
-                    setRequestProperty("User-Agent", "ExonedRouter/3.0 (Streaming)")
+                    connectTimeout = 15000
+                    readTimeout = 95000
+                    setRequestProperty("User-Agent", "ExonedRouter/3.5 (SyncedScan)")
                     setRequestProperty("Accept-Encoding", "gzip")
                     setRequestProperty("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
                 }
@@ -1980,10 +2043,7 @@ object UrbanScannerEngine {
 
                 if (conn.responseCode == 200) {
                     val counted = CountingInputStream(conn.inputStream, bytesCounter)
-                    val stream = if ((conn.contentEncoding ?: "").contains("gzip", true)) {
-                        GZIPInputStream(counted)
-                    } else counted
-
+                    val stream = if ((conn.contentEncoding ?: "").contains("gzip", true)) GZIPInputStream(counted) else counted
                     streamParseUrbanChunk(
                         inputStream = stream,
                         s = s, n = n, w = w, e = e,
@@ -2002,20 +2062,20 @@ object UrbanScannerEngine {
                     if (seenPlaces.get() > 0L || seenLanduse.get() > 0L || seenStreets.get() > 0L) {
                         parsedStage1 = true
                         stage1UsedMirror = mIdx
+                        emitSyncedProgress(
+                            30,
+                            "[⏱ ${fmtElapsed(globalStartMs)}] Etapa 1/2 completada (${seenPlaces.get()} pueblos, ${seenLanduse.get()} manchas).",
+                            true,
+                            100,
+                            "▸ [Etapa 1/2]: 100% Completada"
+                        )
                         break
-                    } else {
-                        lastError = "Respuesta vacía en Nodo ${mIdx + 1}, probando respaldo..."
                     }
                 } else {
                     lastError = "Nodo ${mIdx + 1} ocupado (HTTP ${conn.responseCode})"
                 }
             } catch (t: Throwable) {
-                val checkPing = NetworkHealthMonitor.checkInternetPingMs()
-                lastError = if (checkPing < 0L) {
-                    "Tu conexión a Internet se volvió inestable o se desconectó."
-                } else {
-                    "Servidor OSM Nodo ${mIdx + 1} demoró demasiado (${t.localizedMessage ?: "Timeout"})."
-                }
+                lastError = "Timeout en Nodo ${mIdx + 1}: ${t.localizedMessage ?: ""}"
             } finally {
                 stopWatcher.set(true)
                 watcher.interrupt()
@@ -2024,6 +2084,7 @@ object UrbanScannerEngine {
         }
 
         if (!parsedStage1) {
+            onSectorProgress(false, 0, "")
             return Result.failure(Exception(lastError))
         }
 
@@ -2031,130 +2092,153 @@ object UrbanScannerEngine {
             mergeStreetGridIntoUrbanFootprint(rawGrid, streetHits, gridW, gridH)
         }
 
-        // ETAPA 2 ORIGINAL RESTAURADA: 1 Sola consulta de flujo continuo con 'out qt;' intermedio y timeout expandido
+        // ETAPA 2 SECUENCIAL SINCRONIZADA CON TIMEOUT AMPLIO (110s POR SECTOR):
+        // Cada sector llena su propia barra de 0% a 100% y empuja la barra general de 30% a 90% sin retrocesos.
         var parsedStage2 = isLocalScale
         if (!isLocalScale) {
-            val queryStage2Area = if (stateRelationId > 0L) {
-                val areaId = 3600000000L + stateRelationId
-                """
-                    [out:json][timeout:180];
-                    area($areaId)->.st;
-                    way["highway"~"^(residential|living_street|pedestrian)$"](area.st);
+            val strips = buildPolygonClippedStrips(
+                s = s, n = n, w = w, e = e,
+                rings = selectionRings,
+                hasPoly = hasCustomPolygon,
+                maxLatStep = 1.15
+            )
+            val totalStrips = strips.size.coerceAtLeast(1)
+            var stripsSucceeded = 0
+            var totalStage2Kb = 0L
+
+            for ((sIdx, strip) in strips.withIndex()) {
+                val stripBbox = String.format(Locale.US, "%.4f,%.4f,%.4f,%.4f", strip[0], strip[1], strip[2], strip[3])
+                val queryStrip = """
+                    [out:json][timeout:90];
+                    (
+                      way["highway"="residential"]($stripBbox);
+                      way["highway"="living_street"]($stripBbox);
+                      way["highway"="pedestrian"]($stripBbox);
+                    );
                     out ids bb qt;
                 """.trimIndent()
-            } else {
-                """
-                    [out:json][timeout:180];
-                    way["highway"~"^(residential|living_street|pedestrian)$"]($bboxStr);
-                    out ids bb qt;
-                """.trimIndent()
-            }
 
-            val queryStage2BboxFallback = """
-                [out:json][timeout:180];
-                way["highway"~"^(residential|living_street|pedestrian)$"]($bboxStr);
-                out ids bb qt;
-            """.trimIndent()
+                var stripOk = false
+                var sectorMaxPct = 0
+                val sectorStartMs = System.currentTimeMillis()
 
-            for (attempt in 0 until OVERPASS_MIRRORS.size * 2) {
-                val mIdx = (stage1UsedMirror + 1 + attempt) % OVERPASS_MIRRORS.size
-                val mirror = OVERPASS_MIRRORS[mIdx]
-                val queryStage2 = if (attempt >= OVERPASS_MIRRORS.size) queryStage2BboxFallback else queryStage2Area
+                // Al empezar el sector sIdx, la barra de sector se pone en 0%
+                val initialGlobalPct = 30 + ((sIdx * 100) * 60) / (totalStrips * 100)
+                emitSyncedProgress(
+                    initialGlobalPct,
+                    "[⏱ ${fmtElapsed(globalStartMs)}] Etapa 2/2 ($stripsSucceeded/$totalStrips sectores): ${seenStreets.get()} calles...",
+                    true,
+                    0,
+                    "▸ [Sector ${sIdx + 1}/$totalStrips]: 0% (Iniciando consulta...)"
+                )
 
-                val bytesCounter = AtomicLong(0L)
-                val stopWatcher = AtomicBoolean(false)
-                val tStart = System.currentTimeMillis()
+                for (attempt in 0 until OVERPASS_MIRRORS.size) {
+                    val mIdx = (stage1UsedMirror + sIdx + attempt) % OVERPASS_MIRRORS.size
+                    val mirror = OVERPASS_MIRRORS[mIdx]
+                    val bytesCounter = AtomicLong(0L)
+                    val stopWatcher = AtomicBoolean(false)
 
-                val watcher = thread(start = true, isDaemon = true) {
-                    var silence_seconds = 0
-                    var last_kb = 0L
-                    while (!stopWatcher.get()) {
-                        val elapsed = (System.currentTimeMillis() - tStart) / 1000.0
-                        val kb = bytesCounter.get() / 1024L
+                    val watcher = thread(start = true, isDaemon = true) {
+                        while (!stopWatcher.get()) {
+                            val secElapsed = (System.currentTimeMillis() - sectorStartMs) / 1000.0
+                            val kb = bytesCounter.get() / 1024L
 
-                        if (kb == last_kb) silence_seconds++ else silence_seconds = 0
-                        last_kb = kb
+                            val rawSecPct = if (kb == 0L) {
+                                // Curva asintótica suave mientras Overpass empaqueta el sector (nunca se congela ni retrocede)
+                                ((1.0 - kotlin.math.exp(-secElapsed / 20.0)) * 68.0).toInt().coerceIn(1, 68)
+                            } else {
+                                (68 + (kb / 12).toInt()).coerceIn(69, 98)
+                            }
+                            if (rawSecPct > sectorMaxPct) sectorMaxPct = rawSecPct
 
-                        if (kb == 0L) {
-                            onProgress(
-                                64,
-                                "Etapa 2/2: Vinculando cuadras y calles de pueblos (${String.format(Locale.US, "%.1f", elapsed)}s)..."
-                            )
-                        } else {
-                            val kbs = (kb / max(0.4, elapsed)).toInt()
-                            val stallMsg = if (silence_seconds > 4) " (Transfiriendo...)" else ""
-                            val pct = min(89, 65 + (kb / 120).toInt().coerceAtMost(24))
-                            onProgress(
-                                pct,
-                                "[Etapa 2/2: $kb KB a $kbs KB/s]$stallMsg Rellenando cuadras: ${seenStreets.get()} calles..."
-                            )
+                            val syncedGlobalPct = 30 + ((sIdx * 100 + sectorMaxPct) * 60) / (totalStrips * 100)
+                            val kbs = if (kb > 0L) (kb / max(0.3, secElapsed)).toInt() else 0
+                            val dispKb = totalStage2Kb + kb
+
+                            val secMsg = "▸ [Sector ${sIdx + 1}/$totalStrips — Nodo ${mIdx + 1}]: $sectorMaxPct% ($kb KB | ${String.format(Locale.US, "%.1f", secElapsed)}s) — Listos: $stripsSucceeded/$totalStrips"
+                            val globMsg = "[⏱ ${fmtElapsed(globalStartMs)}] Etapa 2/2 ($stripsSucceeded/$totalStrips sectores): ${seenStreets.get()} calles ($dispKb KB | $kbs KB/s)..."
+
+                            emitSyncedProgress(syncedGlobalPct, globMsg, true, sectorMaxPct, secMsg)
+                            try { Thread.sleep(320) } catch (_: InterruptedException) { break }
                         }
-                        try {
-                            Thread.sleep(1000)
-                        } catch (_: InterruptedException) {
+                    }
+
+                    var conn: HttpURLConnection? = null
+                    try {
+                        val postData = "data=" + URLEncoder.encode(queryStrip, "UTF-8")
+                        conn = (URL(mirror).openConnection() as HttpURLConnection).apply {
+                            requestMethod = "POST"
+                            doOutput = true
+                            connectTimeout = 15000
+                            readTimeout = 110000 // 110 segundos por sector para evitar cortes prematuros
+                            setRequestProperty("User-Agent", "ExonedRouter/3.5 (Strip-$sIdx)")
+                            setRequestProperty("Accept-Encoding", "gzip")
+                            setRequestProperty("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
+                        }
+                        conn.outputStream.use { it.write(postData.toByteArray(Charsets.UTF_8)) }
+
+                        if (conn.responseCode == 200) {
+                            val counted = CountingInputStream(conn.inputStream, bytesCounter)
+                            val stream = if ((conn.contentEncoding ?: "").contains("gzip", true)) GZIPInputStream(counted) else counted
+                            streamParseUrbanChunk(
+                                inputStream = stream,
+                                s = s, n = n, w = w, e = e,
+                                limitX0 = limitX0, limitY0 = limitY0,
+                                gridW = gridW, gridH = gridH,
+                                rawGrid = rawGrid,
+                                streetHits = streetHits,
+                                wayLatBuf = wayLatBuf,
+                                wayLonBuf = wayLonBuf,
+                                seenPlaces = seenPlaces,
+                                seenLanduse = seenLanduse,
+                                seenStreets = seenStreets,
+                                onPlaceNameSeen = {}
+                            )
+                            stopWatcher.set(true)
+                            totalStage2Kb += (bytesCounter.get() / 1024L)
+                            stripOk = true
+                            stripsSucceeded++
+
+                            val doneGlobalPct = 30 + (((sIdx + 1) * 100) * 60) / (totalStrips * 100)
+                            emitSyncedProgress(
+                                doneGlobalPct,
+                                "[⏱ ${fmtElapsed(globalStartMs)}] Etapa 2/2 ($stripsSucceeded/$totalStrips sectores): ${seenStreets.get()} calles ($totalStage2Kb KB)...",
+                                true,
+                                100,
+                                "▸ [Sector ${sIdx + 1}/$totalStrips]: 100% Completado — Listos: $stripsSucceeded/$totalStrips"
+                            )
                             break
                         }
-                    }
-                }
-
-                var conn: HttpURLConnection? = null
-                try {
-                    val postData = "data=" + URLEncoder.encode(queryStage2, "UTF-8")
-                    conn = (URL(mirror).openConnection() as HttpURLConnection).apply {
-                        requestMethod = "POST"
-                        doOutput = true
-                        connectTimeout = 18000
-                        readTimeout = 180000 // Aumentado a 3 minutos para estados gigantes como Veracruz
-                        setRequestProperty("User-Agent", "ExonedRouter/3.0 (Streaming)")
-                        setRequestProperty("Accept-Encoding", "gzip")
-                        setRequestProperty("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
-                    }
-                    conn.outputStream.use { it.write(postData.toByteArray(Charsets.UTF_8)) }
-
-                    if (conn.responseCode == 200) {
-                        val counted = CountingInputStream(conn.inputStream, bytesCounter)
-                        val stream = if ((conn.contentEncoding ?: "").contains("gzip", true)) {
-                            GZIPInputStream(counted)
-                        } else counted
-
-                        streamParseUrbanChunk(
-                            inputStream = stream,
-                            s = s, n = n, w = w, e = e,
-                            limitX0 = limitX0, limitY0 = limitY0,
-                            gridW = gridW, gridH = gridH,
-                            rawGrid = rawGrid,
-                            streetHits = streetHits,
-                            wayLatBuf = wayLatBuf,
-                            wayLonBuf = wayLonBuf,
-                            seenPlaces = seenPlaces,
-                            seenLanduse = seenLanduse,
-                            seenStreets = seenStreets,
-                            onPlaceNameSeen = {}
-                        )
+                    } catch (_: Throwable) {
+                    } finally {
                         stopWatcher.set(true)
-                        if (seenStreets.get() > 0L) {
-                            mergeStreetGridIntoUrbanFootprint(rawGrid, streetHits, gridW, gridH)
-                            parsedStage2 = true
-                            break
-                        }
+                        watcher.interrupt()
+                        conn?.disconnect()
                     }
-                } catch (_: Throwable) {
-                } finally {
-                    stopWatcher.set(true)
-                    watcher.interrupt()
-                    conn?.disconnect()
                 }
-                try { Thread.sleep(800) } catch (_: Throwable) {}
+
+                if (!stripOk) {
+                    try { Thread.sleep(400) } catch (_: Throwable) {}
+                }
             }
 
-            if (!parsedStage2 && seenStreets.get() > 0L) {
+            if (seenStreets.get() > 0L) {
                 mergeStreetGridIntoUrbanFootprint(rawGrid, streetHits, gridW, gridH)
-                parsedStage2 = true
+                parsedStage2 = (stripsSucceeded == totalStrips)
             }
         }
 
+        // Ocultar la barra de sector en cuanto terminan los sectores
+        onSectorProgress(false, 100, "")
+
         return try {
-            onProgress(92, "Perfilando ${seenPlaces.get()} pueblos, ${seenLanduse.get()} manchas y ${seenStreets.get()} cuadras...")
+            emitSyncedProgress(
+                92,
+                "[⏱ ${fmtElapsed(globalStartMs)}] Perfilando ${seenPlaces.get()} pueblos, ${seenLanduse.get()} manchas y ${seenStreets.get()} calles...",
+                false,
+                100,
+                ""
+            )
             val tightGrid = consolidateTightUrbanFootprint(rawGrid, gridW, gridH)
 
             if (hasCustomPolygon && !selectionRings.isNullOrEmpty()) {
@@ -2179,9 +2263,21 @@ object UrbanScannerEngine {
                 }
             }
 
-            onProgress(96, "Trazando contornos vectoriales de alta precisión...")
+            emitSyncedProgress(
+                96,
+                "[⏱ ${fmtElapsed(globalStartMs)}] Trazando contornos vectoriales de alta precisión...",
+                false,
+                100,
+                ""
+            )
             val (polygonsJson, counts) = buildPolygonsFromCells(finalCellsZ16)
-            onProgress(100, "Escaneo completado.")
+            emitSyncedProgress(
+                100,
+                "[⏱ ${fmtElapsed(globalStartMs)}] Escaneo completado.",
+                false,
+                100,
+                ""
+            )
 
             Result.success(
                 UrbanScanResult(
@@ -2194,6 +2290,7 @@ object UrbanScannerEngine {
                 )
             )
         } catch (t: Throwable) {
+            onSectorProgress(false, 0, "")
             Result.failure(Exception(t.localizedMessage ?: "Error consolidando malla"))
         }
     }
@@ -2650,6 +2747,8 @@ class ExonedRouterActivity : AppCompatActivity() {
     private lateinit var btnClearUrban: Button
     private lateinit var pbUrbanScan: ProgressBar
     private lateinit var txtUrbanProgressPct: TextView
+    private lateinit var pbUrbanSectorScan: ProgressBar
+    private lateinit var txtUrbanSectorStatus: TextView
     private lateinit var btnBrushAddTown: Button
     private lateinit var btnBrushEraseTown: Button
     private lateinit var btnSaveAreaPreset: Button
@@ -3375,6 +3474,24 @@ class ExonedRouterActivity : AppCompatActivity() {
             setPadding(0, dp(2), 0, dp(4))
         }
 
+        pbUrbanSectorScan = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
+            max = 100
+            progress = 0
+            visibility = View.GONE
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(7)).apply {
+                topMargin = dp(2)
+            }
+        }
+
+        txtUrbanSectorStatus = TextView(this).apply {
+            text = ""
+            setTextColor(COLOR_AMBER)
+            textSize = 10f
+            typeface = Typeface.MONOSPACE
+            visibility = View.GONE
+            setPadding(0, dp(2), 0, dp(4))
+        }
+
         val brushRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             setPadding(0, dp(4), 0, dp(4))
@@ -3452,6 +3569,8 @@ class ExonedRouterActivity : AppCompatActivity() {
         urbanBox.addView(scanBtnsRow)
         urbanBox.addView(pbUrbanScan)
         urbanBox.addView(txtUrbanProgressPct)
+        urbanBox.addView(pbUrbanSectorScan)
+        urbanBox.addView(txtUrbanSectorStatus)
         urbanBox.addView(brushRow)
         urbanBox.addView(presetRow)
         urbanBox.addView(txtUrbanStatus)
@@ -4449,7 +4568,13 @@ class ExonedRouterActivity : AppCompatActivity() {
         pbUrbanScan.progress = 5
         txtUrbanProgressPct.visibility = View.VISIBLE
         txtUrbanProgressPct.setTextColor(COLOR_CYAN)
-        txtUrbanProgressPct.text = "5% — Iniciando escaneo aditivo (Poblaciones + Cuadras)..."
+        txtUrbanProgressPct.text = "5% — [⏱ 00s] Iniciando escaneo aditivo (Poblaciones + Cuadras)..."
+
+        pbUrbanSectorScan.visibility = View.VISIBLE
+        pbUrbanSectorScan.progress = 0
+        txtUrbanSectorStatus.visibility = View.VISIBLE
+        txtUrbanSectorStatus.text = "▸ Preparando sectores..."
+
         txtUrbanStatus.setTextColor(COLOR_AMBER)
         txtUrbanStatus.text = "Extrayendo ciudades, pueblos y cuadrículas de calles en flujo continuo..."
 
@@ -4478,7 +4603,15 @@ class ExonedRouterActivity : AppCompatActivity() {
                         west = st.west,
                         selectionRings = st.rings,
                         hasCustomPolygon = true,
-                        stateRelationId = st.relationId
+                        stateRelationId = st.relationId,
+                        onSectorProgress = { visible, secPct, secMsg ->
+                            mainHandler.post {
+                                pbUrbanSectorScan.visibility = if (visible) View.VISIBLE else View.GONE
+                                txtUrbanSectorStatus.visibility = if (visible) View.VISIBLE else View.GONE
+                                pbUrbanSectorScan.progress = secPct
+                                txtUrbanSectorStatus.text = secMsg
+                            }
+                        }
                     ) { pct, stageMsg ->
                         val globalPct = ((stIdx * 100 + pct) / statesSnapshot.size).coerceIn(1, 99)
                         mainHandler.post {
@@ -4501,6 +4634,8 @@ class ExonedRouterActivity : AppCompatActivity() {
                         isScanningUrban = false
                         btnScanUrban.isEnabled = true
                         pbUrbanScan.progress = 0
+                        pbUrbanSectorScan.visibility = View.GONE
+                        txtUrbanSectorStatus.visibility = View.GONE
                         txtUrbanProgressPct.setTextColor(COLOR_CRITICO)
                         txtUrbanProgressPct.text = "[FALLO]: $lastErrStr"
                         btnScanUrban.setBackgroundColor(COLOR_AMBER)
@@ -4516,6 +4651,8 @@ class ExonedRouterActivity : AppCompatActivity() {
                     btnScanUrban.isEnabled = true
                     pbUrbanScan.visibility = View.GONE
                     txtUrbanProgressPct.visibility = View.GONE
+                    pbUrbanSectorScan.visibility = View.GONE
+                    txtUrbanSectorStatus.visibility = View.GONE
 
                     btnScanUrban.setBackgroundColor(COLOR_GREEN)
                     btnScanUrban.setTextColor(Color.BLACK)
@@ -4543,7 +4680,15 @@ class ExonedRouterActivity : AppCompatActivity() {
                     west = wSnap,
                     selectionRings = customRingsSnap,
                     hasCustomPolygon = hasCustomPolySnap,
-                    stateRelationId = 0L
+                    stateRelationId = 0L,
+                    onSectorProgress = { visible, secPct, secMsg ->
+                        mainHandler.post {
+                            pbUrbanSectorScan.visibility = if (visible) View.VISIBLE else View.GONE
+                            txtUrbanSectorStatus.visibility = if (visible) View.VISIBLE else View.GONE
+                            pbUrbanSectorScan.progress = secPct
+                            txtUrbanSectorStatus.text = secMsg
+                        }
+                    }
                 ) { pct, stageMsg ->
                     mainHandler.post {
                         pbUrbanScan.progress = pct
@@ -4554,6 +4699,8 @@ class ExonedRouterActivity : AppCompatActivity() {
                 mainHandler.post {
                     isScanningUrban = false
                     btnScanUrban.isEnabled = true
+                    pbUrbanSectorScan.visibility = View.GONE
+                    txtUrbanSectorStatus.visibility = View.GONE
 
                     result.onSuccess { scan ->
                         pbUrbanScan.visibility = View.GONE
@@ -4609,6 +4756,8 @@ class ExonedRouterActivity : AppCompatActivity() {
         btnClearUrban.visibility = View.GONE
         pbUrbanScan.visibility = View.GONE
         txtUrbanProgressPct.visibility = View.GONE
+        pbUrbanSectorScan.visibility = View.GONE
+        txtUrbanSectorStatus.visibility = View.GONE
         btnScanUrban.setBackgroundColor(COLOR_GREEN)
         btnScanUrban.setTextColor(Color.BLACK)
         btnScanUrban.text = ExonedRouterI18n.tr(this, "btn_scan_urban")

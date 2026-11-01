@@ -430,6 +430,8 @@ data class ExonedForgeRecipe(
     val styleIdx: Int,
     val cartoApiKey: String,
     val cartoPremium: Boolean,
+    val primaryTileTemplate: String, // <- AGREGAR ESTA LÍNEA
+    val primaryReferer: String,      // <- AGREGAR ESTA LÍNEA
     val selectedZooms: List<Int>,
     val includeRoutes: Boolean,
     val routesOnly: Boolean = false,
@@ -453,6 +455,8 @@ data class ExonedForgeRecipe(
         root.put("created_at", createdAt)
         root.put("provider_idx", providerIdx)
         root.put("style_idx", styleIdx)
+        root.put("primary_tile_template", primaryTileTemplate) // <- CORREGIDO
+        root.put("primary_referer", primaryReferer)
         root.put("carto_api_key", cartoApiKey)
         root.put("carto_premium", cartoPremium)
         root.put("include_routes", includeRoutes)
@@ -876,6 +880,8 @@ object ExonedForgeEngine {
             styleIdx = styleIdx,
             cartoApiKey = CartoApiManager.getApiKey(context),
             cartoPremium = CartoApiManager.isPremiumAccount(context),
+            primaryTileTemplate = CartoApiManager.getPrimaryTileTemplate(context), // <- AGREGAR ESTA LÍNEA
+            primaryReferer = CartoApiManager.getPrimaryReferer(context),           // <- AGREGAR ESTA LÍNEA
             selectedZooms = if (isRoutesOnlyEffective) emptyList() else selectedZooms.sorted(),
             includeRoutes = if (isRoutesOnlyEffective) true else includeRoutes,
             routesOnly = isRoutesOnlyEffective,
